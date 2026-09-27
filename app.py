@@ -113,6 +113,18 @@ class ReviewStore:
                     decided_by TEXT NOT NULL REFERENCES users(id),
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS supplement_requests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    paper_id INTEGER NOT NULL REFERENCES papers(id),
+                    assignment_id INTEGER NOT NULL UNIQUE REFERENCES assignments(id),
+                    reviewer_id TEXT NOT NULL REFERENCES users(id),
+                    requested_by TEXT NOT NULL REFERENCES users(id),
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending','responded')),
+                    response_text TEXT,
+                    created_at TEXT NOT NULL,
+                    responded_at TEXT
+                );
                 CREATE TABLE IF NOT EXISTS audit_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     paper_id INTEGER,
@@ -356,6 +368,72 @@ class ReviewStore:
             self._audit(conn, paper_id, author_id, "rebuttal.submit", {"rebuttal_id": cur.lastrowid})
             return {"id": cur.lastrowid, "paper_id": paper_id, "content": content.strip()}
 
+    def request_supplement(self, chair_id: str, paper_id: int, reviewer_id: str) -> dict:
+        """主席请已完成评审的评审人补充说明；原评分与意见保持不变。"""
+        with self.connect() as conn:
+            chair = self._user(conn, chair_id)
+            self._require(chair, "chair")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                paper = conn.execute("SELECT status FROM papers WHERE id=?", (paper_id,)).fetchone()
+                if not paper or paper["status"] == "decided":
+                    raise BusinessError("论文不存在或已经决定", 409, "paper_decided")
+                assignment = conn.execute(
+                    "SELECT * FROM assignments WHERE paper_id=? AND reviewer_id=?",
+                    (paper_id, reviewer_id),
+                ).fetchone()
+                if not assignment or assignment["status"] != "completed":
+                    raise BusinessError("只能请已完成评审的评审人补充说明", 409, "review_not_completed")
+                if conn.execute(
+                    "SELECT 1 FROM supplement_requests WHERE assignment_id=?", (assignment["id"],)
+                ).fetchone():
+                    raise BusinessError("该评审的补充说明请求已存在", 409, "supplement_exists")
+                cur = conn.execute(
+                    "INSERT INTO supplement_requests(paper_id,assignment_id,reviewer_id,requested_by,created_at) VALUES(?,?,?,?,?)",
+                    (paper_id, assignment["id"], reviewer_id, chair_id, utcnow()),
+                )
+                self._audit(conn, paper_id, chair_id, "supplement.request", {"request_id": cur.lastrowid, "reviewer_id": reviewer_id})
+                return {"id": cur.lastrowid, "paper_id": paper_id, "reviewer_id": reviewer_id, "status": "pending"}
+            except Exception:
+                conn.rollback()
+                raise
+
+    def respond_supplement(self, reviewer_id: str, request_id: int, text: str) -> dict:
+        """评审人本人填写补充说明，原评审记录不改动。"""
+        if len(text.strip()) < 10:
+            raise BusinessError("补充说明至少 10 字", 422, "response_too_short")
+        with self.connect() as conn:
+            reviewer = self._user(conn, reviewer_id)
+            self._require(reviewer, "reviewer")
+            row = conn.execute("SELECT * FROM supplement_requests WHERE id=?", (request_id,)).fetchone()
+            if not row or row["reviewer_id"] != reviewer_id:
+                raise BusinessError("补充说明请求不存在或不属于当前评审人", 404, "not_found")
+            if row["status"] != "pending":
+                raise BusinessError("补充说明请求已经处理", 409, "supplement_already_answered")
+            conn.execute(
+                "UPDATE supplement_requests SET status='responded',response_text=?,responded_at=? WHERE id=?",
+                (text.strip(), utcnow(), request_id),
+            )
+            self._audit(conn, row["paper_id"], reviewer_id, "supplement.respond", {"request_id": request_id})
+            return {"id": request_id, "status": "responded"}
+
+    def list_supplements(self, user_id: str, paper_id: int) -> list[dict]:
+        """主席与被点名的评审人可查看补充说明请求及回应。"""
+        with self.connect() as conn:
+            user = self._user(conn, user_id)
+            if not conn.execute("SELECT 1 FROM papers WHERE id=?", (paper_id,)).fetchone():
+                raise BusinessError("论文不存在", 404, "not_found")
+            if user["role"] != "chair":
+                allowed = user["role"] == "reviewer" and conn.execute(
+                    "SELECT 1 FROM assignments WHERE paper_id=? AND reviewer_id=?", (paper_id, user_id)
+                ).fetchone()
+                if not allowed:
+                    raise BusinessError("无权查看该论文的补充说明", 403, "forbidden")
+            rows = conn.execute(
+                "SELECT * FROM supplement_requests WHERE paper_id=? ORDER BY id", (paper_id,)
+            ).fetchall()
+            return [dict(row) for row in rows]
+
     def decide(self, chair_id: str, paper_id: int, decision: str, note: str = "") -> dict:
         if decision not in VALID_DECISIONS:
             raise BusinessError("决定值不合法", 422, "invalid_decision")
@@ -370,6 +448,9 @@ class ReviewStore:
                 completed = conn.execute("SELECT COUNT(*) FROM assignments WHERE paper_id=? AND status='completed'", (paper_id,)).fetchone()[0]
                 if completed < 2:
                     raise BusinessError("至少需要两份已完成评审才能作出决定", 409, "insufficient_reviews")
+                pending = conn.execute("SELECT COUNT(*) FROM supplement_requests WHERE paper_id=? AND status='pending'", (paper_id,)).fetchone()[0]
+                if pending > 0:
+                    raise BusinessError("存在未回应的补充说明请求，暂不能作决定", 409, "pending_supplements")
                 cur = conn.execute(
                     "INSERT INTO decisions(paper_id,decision,note,decided_by,created_at) VALUES(?,?,?,?,?)",
                     (paper_id, decision, note.strip(), chair_id, utcnow()),
@@ -455,6 +536,11 @@ class ReviewHandler(BaseHTTPRequestHandler):
             if len(parts) == 4 and parts[3] == "decision" and method == "POST":
                 data = self._body()
                 return self._send(201, store.decide(self._user_id(), paper_id, data.get("decision", ""), data.get("note", "")))
+            if len(parts) == 4 and parts[3] == "supplements" and method == "POST":
+                data = self._body()
+                return self._send(201, store.request_supplement(self._user_id(), paper_id, data.get("reviewer_id", "")))
+            if len(parts) == 4 and parts[3] == "supplements" and method == "GET":
+                return self._send(200, {"items": store.list_supplements(self._user_id(), paper_id)})
             if len(parts) == 4 and parts[3] == "history" and method == "GET":
                 return self._send(200, {"items": store.history(self._user_id(), paper_id)})
         if len(parts) == 4 and parts[:2] == ["api", "assignments"] and method == "POST":
@@ -464,6 +550,9 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 return self._send(200, store.respond_assignment(self._user_id(), assignment_id, bool(data.get("accepted"))))
             if parts[3] == "review":
                 return self._send(201, store.submit_review(self._user_id(), assignment_id, data.get("score"), data.get("text", "")))
+        if len(parts) == 4 and parts[:2] == ["api", "supplements"] and parts[3] == "respond" and method == "POST":
+            data = self._body()
+            return self._send(200, store.respond_supplement(self._user_id(), int(parts[2]), data.get("text", "")))
         raise BusinessError("接口不存在", 404, "not_found")
 
     def do_GET(self):

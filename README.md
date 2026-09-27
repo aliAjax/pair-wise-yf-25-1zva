@@ -27,9 +27,12 @@ python -m unittest -v
 - `POST /api/assignments/{id}/respond`：接受或拒绝邀请。
 - `POST /api/assignments/{id}/review`：提交 1-5 分评审。
 - `POST /api/papers/{id}/rebuttal`：作者提交一次 Rebuttal。
-- `POST /api/papers/{id}/decision`：收到至少两份评审后作决定。
+- `POST /api/papers/{id}/supplements`：主席请已完成评审的评审人补充说明（每份评审仅一次）。
+- `GET /api/papers/{id}/supplements`：主席与被点名的评审人查看补充说明请求及回应。
+- `POST /api/supplements/{id}/respond`：评审人本人填写补充说明。
+- `POST /api/papers/{id}/decision`：收到至少两份评审后作决定；存在未回应的补充说明请求时不能作决定。
 - `GET /api/papers/{id}/history`：审计历史。
 
 ## 业务不变量
 
-评审人不能查看未分配论文的作者身份；利益冲突禁止投标和分配；邀请和完成状态不能跳步；每位评审人的未完成分配受 `load_limit` 限制；每篇论文只能提交一次 Rebuttal；决定必须至少基于两份已完成评审。
+评审人不能查看未分配论文的作者身份；利益冲突禁止投标和分配；邀请和完成状态不能跳步；每位评审人的未完成分配受 `load_limit` 限制；每篇论文只能提交一次 Rebuttal；决定必须至少基于两份已完成评审；补充说明请求只能针对已完成评审且不可重复，只能由被点名的评审人本人回应，未回应的请求未清空时不能作决定；补充说明单独记录，原评分与意见保持不变并继续计入最低要求。

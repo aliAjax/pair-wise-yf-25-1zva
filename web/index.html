@@ -4,10 +4,16 @@
 <body><h1>学术会议同行评审</h1><p>选择身份后，页面会通过 <code>X-User-Id</code> 调用 JSON API。演示账号：alice、bob、r1、r2、r3、chair。</p>
 <div class="grid"><section class="panel"><h2>提交论文</h2><select id="user"><option>alice</option><option>bob</option><option>r1</option><option>r2</option><option>r3</option><option>chair</option></select><input id="title" placeholder="标题"><textarea id="abstract" placeholder="摘要（至少20字）"></textarea><button onclick="submitPaper()">提交</button></section>
 <section class="panel"><h2>查看论文</h2><button onclick="loadPapers()">刷新当前身份可见论文</button><pre id="papers"></pre></section></div>
+<div class="grid"><section class="panel"><h2>补充说明（主席）</h2><p>Rebuttal 之后可请已评完的评审人补充说明；原评分和意见保留，只补记上下文。存在未回应请求时不能作决定。</p><input id="supPaper" placeholder="论文ID"><input id="supReviewer" placeholder="评审人ID，如 r1"><button onclick="requestSupplement()">发起补充说明请求</button><button onclick="loadSupplements()">查看该论文的补充说明</button><pre id="supOut"></pre></section>
+<section class="panel"><h2>补充说明（评审人）</h2><p>主席点名后在此填写回应，提交后请求才算清空。</p><input id="supPaper2" placeholder="论文ID"><button onclick="loadSupplements2()">查看我的补充说明请求</button><input id="supReqId" placeholder="请求ID"><textarea id="supText" placeholder="补充说明（至少10字）"></textarea><button onclick="respondSupplement()">提交回应</button><pre id="supOut2"></pre></section></div>
 <script>
 const headers={"Content-Type":"application/json","X-User-Id":document.querySelector("#user").value};
 document.querySelector("#user").onchange=e=>headers["X-User-Id"]=e.target.value;
 async function api(url,opt={}){const r=await fetch(url,{...opt,headers});return await r.json()}
 async function submitPaper(){const p=await api("/api/papers",{method:"POST",body:JSON.stringify({title:title.value,abstract:abstract.value})});alert(JSON.stringify(p,null,2))}
 async function loadPapers(){papers.textContent=JSON.stringify(await api("/api/papers"),null,2)}
+async function requestSupplement(){supOut.textContent=JSON.stringify(await api(`/api/papers/${supPaper.value}/supplements`,{method:"POST",body:JSON.stringify({reviewer_id:supReviewer.value})}),null,2)}
+async function loadSupplements(){supOut.textContent=JSON.stringify(await api(`/api/papers/${supPaper.value}/supplements`),null,2)}
+async function loadSupplements2(){supOut2.textContent=JSON.stringify(await api(`/api/papers/${supPaper2.value}/supplements`),null,2)}
+async function respondSupplement(){supOut2.textContent=JSON.stringify(await api(`/api/supplements/${supReqId.value}/respond`,{method:"POST",body:JSON.stringify({text:supText.value})}),null,2)}
 </script></body></html>
