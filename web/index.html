@@ -3,11 +3,19 @@
 <style>body{font:16px system-ui;max-width:900px;margin:32px auto;padding:0 16px}input,textarea,select,button{font:inherit;padding:8px;margin:4px}textarea{width:100%;height:90px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.panel{border:1px solid #bbb;padding:16px;border-radius:8px}pre{white-space:pre-wrap;background:#f4f4f4;padding:12px}</style></head>
 <body><h1>学术会议同行评审</h1><p>选择身份后，页面会通过 <code>X-User-Id</code> 调用 JSON API。演示账号：alice、bob、r1、r2、r3、chair。</p>
 <div class="grid"><section class="panel"><h2>提交论文</h2><select id="user"><option>alice</option><option>bob</option><option>r1</option><option>r2</option><option>r3</option><option>chair</option></select><input id="title" placeholder="标题"><textarea id="abstract" placeholder="摘要（至少20字）"></textarea><button onclick="submitPaper()">提交</button></section>
-<section class="panel"><h2>查看论文</h2><button onclick="loadPapers()">刷新当前身份可见论文</button><pre id="papers"></pre></section></div>
+<section class="panel"><h2>查看论文</h2><button onclick="loadPapers()">刷新当前身份可见论文</button><pre id="papers"></pre></section>
+<section class="panel"><h2>主席：请求答辩补充说明</h2><input id="reqPaper" placeholder="论文 ID"><input id="reqReviewer" placeholder="评审人 ID（如 r1）"><button onclick="requestResponse()">发出请求</button><button onclick="loadRequests()">查看该论文的请求与回应</button><pre id="requests"></pre></section>
+<section class="panel"><h2>评审人：填写补充说明</h2><button onclick="loadMyRequests()">刷新我的请求</button><pre id="myRequests"></pre><input id="respId" placeholder="请求 ID"><textarea id="respText" placeholder="补充说明（至少10字）"></textarea><button onclick="respondRequest()">提交回应</button></section>
+<section class="panel"><h2>主席：作出决定</h2><input id="decPaper" placeholder="论文 ID"><select id="decision"><option>accept</option><option>reject</option><option>minor_revision</option><option>major_revision</option></select><input id="decNote" placeholder="决定备注"><button onclick="decide()">提交决定（有未回应请求时会被拒绝）</button></section></div>
 <script>
 const headers={"Content-Type":"application/json","X-User-Id":document.querySelector("#user").value};
 document.querySelector("#user").onchange=e=>headers["X-User-Id"]=e.target.value;
 async function api(url,opt={}){const r=await fetch(url,{...opt,headers});return await r.json()}
 async function submitPaper(){const p=await api("/api/papers",{method:"POST",body:JSON.stringify({title:title.value,abstract:abstract.value})});alert(JSON.stringify(p,null,2))}
 async function loadPapers(){papers.textContent=JSON.stringify(await api("/api/papers"),null,2)}
+async function requestResponse(){const r=await api(`/api/papers/${reqPaper.value}/rebuttal-requests`,{method:"POST",body:JSON.stringify({reviewer_id:reqReviewer.value})});alert(JSON.stringify(r,null,2))}
+async function loadRequests(){requests.textContent=JSON.stringify(await api(`/api/papers/${reqPaper.value}/rebuttal-requests`),null,2)}
+async function loadMyRequests(){myRequests.textContent=JSON.stringify(await api("/api/rebuttal-requests"),null,2)}
+async function respondRequest(){const r=await api(`/api/rebuttal-requests/${respId.value}/respond`,{method:"POST",body:JSON.stringify({response:respText.value})});alert(JSON.stringify(r,null,2));loadMyRequests()}
+async function decide(){const r=await api(`/api/papers/${decPaper.value}/decision`,{method:"POST",body:JSON.stringify({decision:decision.value,note:decNote.value})});alert(JSON.stringify(r,null,2))}
 </script></body></html>

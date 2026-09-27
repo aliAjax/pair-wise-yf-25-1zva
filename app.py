@@ -105,6 +105,18 @@ class ReviewStore:
                     content TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS rebuttal_requests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    paper_id INTEGER NOT NULL REFERENCES papers(id),
+                    assignment_id INTEGER NOT NULL REFERENCES assignments(id),
+                    reviewer_id TEXT NOT NULL REFERENCES users(id),
+                    requested_by TEXT NOT NULL REFERENCES users(id),
+                    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','answered')),
+                    response TEXT,
+                    created_at TEXT NOT NULL,
+                    responded_at TEXT,
+                    UNIQUE (paper_id, reviewer_id)
+                );
                 CREATE TABLE IF NOT EXISTS decisions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     paper_id INTEGER NOT NULL UNIQUE REFERENCES papers(id),
@@ -356,6 +368,104 @@ class ReviewStore:
             self._audit(conn, paper_id, author_id, "rebuttal.submit", {"rebuttal_id": cur.lastrowid})
             return {"id": cur.lastrowid, "paper_id": paper_id, "content": content.strip()}
 
+    def request_rebuttal_response(self, chair_id: str, paper_id: int, reviewer_id: str) -> dict:
+        """主席请已完成评审的评审人就 Rebuttal 补充说明。原评审保持不变。"""
+        with self.connect() as conn:
+            chair = self._user(conn, chair_id)
+            self._require(chair, "chair")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                paper = conn.execute("SELECT status FROM papers WHERE id=?", (paper_id,)).fetchone()
+                if not paper or paper["status"] not in {"submitted", "under_review"}:
+                    raise BusinessError("论文不存在或已经决定", 409, "paper_decided")
+                reviewer = self._user(conn, reviewer_id)
+                self._require(reviewer, "reviewer")
+                assignment = conn.execute(
+                    "SELECT id FROM assignments WHERE paper_id=? AND reviewer_id=? AND status='completed'",
+                    (paper_id, reviewer_id),
+                ).fetchone()
+                if not assignment:
+                    raise BusinessError("只能请已完成评审的评审人补充说明", 409, "review_not_completed")
+                try:
+                    cur = conn.execute(
+                        "INSERT INTO rebuttal_requests(paper_id,assignment_id,reviewer_id,requested_by,created_at) VALUES(?,?,?,?,?)",
+                        (paper_id, assignment["id"], reviewer_id, chair_id, utcnow()),
+                    )
+                except sqlite3.IntegrityError:
+                    raise BusinessError("已向该评审人发出过补充说明请求", 409, "request_exists")
+                request_id = cur.lastrowid
+                self._audit(conn, paper_id, chair_id, "rebuttal_response.request", {"request_id": request_id, "reviewer_id": reviewer_id})
+                return {"id": request_id, "paper_id": paper_id, "reviewer_id": reviewer_id, "status": "pending"}
+            except Exception:
+                conn.rollback()
+                raise
+
+    def respond_rebuttal_request(self, reviewer_id: str, request_id: int, response: str) -> dict:
+        """评审人本人填写补充说明；只补记上下文，不改动 assignments 里的原评分和意见。"""
+        response = response.strip()
+        if len(response) < 10:
+            raise BusinessError("补充说明至少 10 字", 422, "response_too_short")
+        with self.connect() as conn:
+            reviewer = self._user(conn, reviewer_id)
+            self._require(reviewer, "reviewer")
+            row = conn.execute("SELECT * FROM rebuttal_requests WHERE id=?", (request_id,)).fetchone()
+            if not row or row["reviewer_id"] != reviewer_id:
+                raise BusinessError("请求不存在或不属于当前评审人", 404, "not_found")
+            cur = conn.execute(
+                "UPDATE rebuttal_requests SET status='answered',response=?,responded_at=? WHERE id=? AND status='pending'",
+                (response, utcnow(), request_id),
+            )
+            if cur.rowcount == 0:
+                raise BusinessError("该补充说明请求已回应", 409, "already_answered")
+            self._audit(conn, row["paper_id"], reviewer_id, "rebuttal_response.submit", {"request_id": request_id})
+            return {"id": request_id, "paper_id": row["paper_id"], "status": "answered"}
+
+    @staticmethod
+    def _rebuttal_request_view(row: sqlite3.Row) -> dict:
+        data = {
+            "id": row["id"],
+            "paper_id": row["paper_id"],
+            "reviewer_id": row["reviewer_id"],
+            "status": row["status"],
+            "response": row["response"],
+            "score": row["score"],  # 原评分与意见保留，回应只作为旁边的补充上下文。
+            "review_text": row["review_text"],
+            "created_at": row["created_at"],
+            "responded_at": row["responded_at"],
+        }
+        if "title" in row.keys():
+            data["title"] = row["title"]
+        return data
+
+    def list_rebuttal_requests(self, user_id: str, paper_id: int) -> list[dict]:
+        with self.connect() as conn:
+            user = self._user(conn, user_id)
+            if user["role"] not in {"chair", "reviewer"}:
+                raise BusinessError("该操作仅允许 chair 或 reviewer 角色", 403, "forbidden")
+            if not conn.execute("SELECT 1 FROM papers WHERE id=?", (paper_id,)).fetchone():
+                raise BusinessError("论文不存在", 404, "not_found")
+            sql = """SELECT q.*, a.score, a.review_text FROM rebuttal_requests q
+                     JOIN assignments a ON a.id=q.assignment_id WHERE q.paper_id=?"""
+            params: list = [paper_id]
+            if user["role"] == "reviewer":
+                sql += " AND q.reviewer_id=?"  # 评审人只能看到自己的请求。
+                params.append(user_id)
+            rows = conn.execute(sql + " ORDER BY q.id", params).fetchall()
+            return [self._rebuttal_request_view(row) for row in rows]
+
+    def my_rebuttal_requests(self, reviewer_id: str) -> list[dict]:
+        with self.connect() as conn:
+            reviewer = self._user(conn, reviewer_id)
+            self._require(reviewer, "reviewer")
+            rows = conn.execute(
+                """SELECT q.*, a.score, a.review_text, p.title FROM rebuttal_requests q
+                   JOIN assignments a ON a.id=q.assignment_id
+                   JOIN papers p ON p.id=q.paper_id
+                   WHERE q.reviewer_id=? ORDER BY q.id""",
+                (reviewer_id,),
+            ).fetchall()
+            return [self._rebuttal_request_view(row) for row in rows]
+
     def decide(self, chair_id: str, paper_id: int, decision: str, note: str = "") -> dict:
         if decision not in VALID_DECISIONS:
             raise BusinessError("决定值不合法", 422, "invalid_decision")
@@ -370,6 +480,9 @@ class ReviewStore:
                 completed = conn.execute("SELECT COUNT(*) FROM assignments WHERE paper_id=? AND status='completed'", (paper_id,)).fetchone()[0]
                 if completed < 2:
                     raise BusinessError("至少需要两份已完成评审才能作出决定", 409, "insufficient_reviews")
+                pending = conn.execute("SELECT COUNT(*) FROM rebuttal_requests WHERE paper_id=? AND status='pending'", (paper_id,)).fetchone()[0]
+                if pending:
+                    raise BusinessError("仍有未回应的补充说明请求，不能作决定", 409, "pending_rebuttal_responses")
                 cur = conn.execute(
                     "INSERT INTO decisions(paper_id,decision,note,decided_by,created_at) VALUES(?,?,?,?,?)",
                     (paper_id, decision, note.strip(), chair_id, utcnow()),
@@ -452,6 +565,11 @@ class ReviewHandler(BaseHTTPRequestHandler):
             if len(parts) == 4 and parts[3] == "rebuttal" and method == "POST":
                 data = self._body()
                 return self._send(201, store.submit_rebuttal(self._user_id(), paper_id, data.get("content", "")))
+            if len(parts) == 4 and parts[3] == "rebuttal-requests" and method == "POST":
+                data = self._body()
+                return self._send(201, store.request_rebuttal_response(self._user_id(), paper_id, data.get("reviewer_id", "")))
+            if len(parts) == 4 and parts[3] == "rebuttal-requests" and method == "GET":
+                return self._send(200, {"items": store.list_rebuttal_requests(self._user_id(), paper_id)})
             if len(parts) == 4 and parts[3] == "decision" and method == "POST":
                 data = self._body()
                 return self._send(201, store.decide(self._user_id(), paper_id, data.get("decision", ""), data.get("note", "")))
@@ -464,6 +582,11 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 return self._send(200, store.respond_assignment(self._user_id(), assignment_id, bool(data.get("accepted"))))
             if parts[3] == "review":
                 return self._send(201, store.submit_review(self._user_id(), assignment_id, data.get("score"), data.get("text", "")))
+        if parts == ["api", "rebuttal-requests"] and method == "GET":
+            return self._send(200, {"items": store.my_rebuttal_requests(self._user_id())})
+        if len(parts) == 4 and parts[:2] == ["api", "rebuttal-requests"] and parts[3] == "respond" and method == "POST":
+            data = self._body()
+            return self._send(200, store.respond_rebuttal_request(self._user_id(), int(parts[2]), data.get("response", "")))
         raise BusinessError("接口不存在", 404, "not_found")
 
     def do_GET(self):
